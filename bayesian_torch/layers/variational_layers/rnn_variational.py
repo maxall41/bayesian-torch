@@ -51,6 +51,7 @@ class LSTMReparameterization(BaseVariationalLayer_):
                  prior_variance=1,
                  posterior_mu_init=0,
                  posterior_rho_init=-3.0,
+                 batch_first=False,
                  bias=True):
         """
         Implements LSTM layer with reparameterization trick.
@@ -76,6 +77,7 @@ class LSTMReparameterization(BaseVariationalLayer_):
         # variance of weight --> sigma = log (1 + exp(rho))
         self.posterior_rho_init = posterior_rho_init,
         self.bias = bias
+        self.batch_first = batch_first
 
         self.ih = LinearReparameterization(
             prior_mean=prior_mean,
@@ -104,7 +106,9 @@ class LSTMReparameterization(BaseVariationalLayer_):
 
         if self.dnn_to_bnn_flag:
             return_kl = False
-
+        if self.batch_first:
+            X = X.transpose(0, 1)
+        
         batch_size, seq_size, _ = X.size()
 
         hidden_seq = []
@@ -151,3 +155,136 @@ class LSTMReparameterization(BaseVariationalLayer_):
         if return_kl:
             return hidden_seq, (hidden_seq, c_ts), kl
         return hidden_seq, (hidden_seq, c_ts)
+
+
+class BidirectionalLSTMReparameterization(BaseVariationalLayer_):
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 prior_mean=0,
+                 prior_variance=1,
+                 posterior_mu_init=0,
+                 posterior_rho_init=-3.0,
+                 batch_first=False,
+                 bias=True):
+        """
+        Implements Bidirectional LSTM layer with reparameterization trick.
+
+        Inherits from bayesian_torch.layers.BaseVariationalLayer_
+
+        Parameters:
+            prior_mean: float -> mean of the prior arbitrary distribution to be used on the complexity cost,
+            prior_variance: float -> variance of the prior arbitrary distribution to be used on the complexity cost,
+            posterior_mu_init: float -> init std for the trainable mu parameter, sampled from N(0, posterior_mu_init),
+            posterior_rho_init: float -> init std for the trainable rho parameter, sampled from N(0, posterior_rho_init),
+            in_features: int -> size of each input sample,
+            out_features: int -> size of each output sample,
+            bias: bool -> if set to False, the layer will not learn an additive bias. Default: True,
+        """
+        super().__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.prior_mean = prior_mean
+        self.prior_variance = prior_variance
+        self.posterior_mu_init = posterior_mu_init
+        self.posterior_rho_init = posterior_rho_init
+        self.bias = bias
+        self.batch_first = batch_first
+
+        # Forward LSTM
+        self.forward_ih = LinearReparameterization(
+            prior_mean=prior_mean,
+            prior_variance=prior_variance,
+            posterior_mu_init=posterior_mu_init,
+            posterior_rho_init=posterior_rho_init,
+            in_features=in_features,
+            out_features=out_features * 4,
+            bias=bias)
+
+        self.forward_hh = LinearReparameterization(
+            prior_mean=prior_mean,
+            prior_variance=prior_variance,
+            posterior_mu_init=posterior_mu_init,
+            posterior_rho_init=posterior_rho_init,
+            in_features=out_features,
+            out_features=out_features * 4,
+            bias=bias)
+
+        # Backward LSTM
+        self.backward_ih = LinearReparameterization(
+            prior_mean=prior_mean,
+            prior_variance=prior_variance,
+            posterior_mu_init=posterior_mu_init,
+            posterior_rho_init=posterior_rho_init,
+            in_features=in_features,
+            out_features=out_features * 4,
+            bias=bias)
+
+        self.backward_hh = LinearReparameterization(
+            prior_mean=prior_mean,
+            prior_variance=prior_variance,
+            posterior_mu_init=posterior_mu_init,
+            posterior_rho_init=posterior_rho_init,
+            in_features=out_features,
+            out_features=out_features * 4,
+            bias=bias)
+
+    def kl_loss(self):
+        return (self.forward_ih.kl_loss() + self.forward_hh.kl_loss() +
+                self.backward_ih.kl_loss() + self.backward_hh.kl_loss())
+
+    def _process_direction(self, X, ih, hh, reverse=False):
+        batch_size, seq_size, _ = X.size()
+        hidden_seq = []
+        h_t = c_t = torch.zeros(batch_size, self.out_features).to(X.device)
+        HS = self.out_features
+        kl = 0
+
+        sequence = range(seq_size) if not reverse else range(seq_size - 1, -1, -1)
+
+        for t in sequence:
+            x_t = X[:, t, :]
+
+            ff_i, kl_i = ih(x_t)
+            ff_h, kl_h = hh(h_t)
+            gates = ff_i + ff_h
+
+            kl += kl_i + kl_h
+
+            i_t, f_t, g_t, o_t = (
+                torch.sigmoid(gates[:, :HS]),  # input
+                torch.sigmoid(gates[:, HS:HS * 2]),  # forget
+                torch.tanh(gates[:, HS * 2:HS * 3]),
+                torch.sigmoid(gates[:, HS * 3:]),  # output
+            )
+
+            c_t = f_t * c_t + i_t * g_t
+            h_t = o_t * torch.tanh(c_t)
+
+            hidden_seq.append(h_t.unsqueeze(0))
+
+        hidden_seq = torch.cat(hidden_seq, dim=0)
+        if reverse:
+            hidden_seq = hidden_seq.flip(0)
+        
+        return hidden_seq, kl
+
+    def forward(self, X, hidden_states=None, return_kl=True):
+        if self.dnn_to_bnn_flag:
+            return_kl = False
+        if self.batch_first:
+            X = X.transpose(0, 1)
+
+        forward_hidden, forward_kl = self._process_direction(X, self.forward_ih, self.forward_hh)
+        backward_hidden, backward_kl = self._process_direction(X, self.backward_ih, self.backward_hh, reverse=True)
+
+        # Concatenate forward and backward sequences
+        hidden_seq = torch.cat([forward_hidden, backward_hidden], dim=2)
+        
+        # Reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
+        hidden_seq = hidden_seq.transpose(0, 1).contiguous()
+
+        if return_kl:
+            return hidden_seq, None, forward_kl + backward_kl
+        return hidden_seq, None
