@@ -161,30 +161,34 @@ class BidirectionalLSTMReparameterization(BaseVariationalLayer_):
     def __init__(self,
                  in_features,
                  out_features,
+                 num_layers=1,
                  prior_mean=0,
                  prior_variance=1,
                  posterior_mu_init=0,
                  posterior_rho_init=-3.0,
-                 batch_first=False,
-                 bias=True):
+                 bias=True,
+                 batch_first=False):
         """
-        Implements Bidirectional LSTM layer with reparameterization trick.
+        Implements Multi-layer Bidirectional LSTM layer with reparameterization trick.
 
         Inherits from bayesian_torch.layers.BaseVariationalLayer_
 
         Parameters:
+            in_features: int -> size of each input sample,
+            out_features: int -> size of each output sample,
+            num_layers: int -> number of recurrent layers. Default: 1
             prior_mean: float -> mean of the prior arbitrary distribution to be used on the complexity cost,
             prior_variance: float -> variance of the prior arbitrary distribution to be used on the complexity cost,
             posterior_mu_init: float -> init std for the trainable mu parameter, sampled from N(0, posterior_mu_init),
             posterior_rho_init: float -> init std for the trainable rho parameter, sampled from N(0, posterior_rho_init),
-            in_features: int -> size of each input sample,
-            out_features: int -> size of each output sample,
             bias: bool -> if set to False, the layer will not learn an additive bias. Default: True,
+            batch_first: bool -> if True, then the input and output tensors are provided as (batch, seq, feature). Default: False
         """
         super().__init__()
 
         self.in_features = in_features
         self.out_features = out_features
+        self.num_layers = num_layers
         self.prior_mean = prior_mean
         self.prior_variance = prior_variance
         self.posterior_mu_init = posterior_mu_init
@@ -192,55 +196,69 @@ class BidirectionalLSTMReparameterization(BaseVariationalLayer_):
         self.bias = bias
         self.batch_first = batch_first
 
-        # Forward LSTM
-        self.forward_ih = LinearReparameterization(
-            prior_mean=prior_mean,
-            prior_variance=prior_variance,
-            posterior_mu_init=posterior_mu_init,
-            posterior_rho_init=posterior_rho_init,
-            in_features=in_features,
-            out_features=out_features * 4,
-            bias=bias)
+        self.forward_layers = nn.ModuleList()
+        self.backward_layers = nn.ModuleList()
 
-        self.forward_hh = LinearReparameterization(
-            prior_mean=prior_mean,
-            prior_variance=prior_variance,
-            posterior_mu_init=posterior_mu_init,
-            posterior_rho_init=posterior_rho_init,
-            in_features=out_features,
-            out_features=out_features * 4,
-            bias=bias)
+        for layer in range(num_layers):
+            layer_in_features = in_features if layer == 0 else out_features * 2
 
-        # Backward LSTM
-        self.backward_ih = LinearReparameterization(
-            prior_mean=prior_mean,
-            prior_variance=prior_variance,
-            posterior_mu_init=posterior_mu_init,
-            posterior_rho_init=posterior_rho_init,
-            in_features=in_features,
-            out_features=out_features * 4,
-            bias=bias)
+            # Forward LSTM
+            self.forward_layers.append(nn.ModuleDict({
+                'ih': LinearReparameterization(
+                    prior_mean=prior_mean,
+                    prior_variance=prior_variance,
+                    posterior_mu_init=posterior_mu_init,
+                    posterior_rho_init=posterior_rho_init,
+                    in_features=layer_in_features,
+                    out_features=out_features * 4,
+                    bias=bias),
+                'hh': LinearReparameterization(
+                    prior_mean=prior_mean,
+                    prior_variance=prior_variance,
+                    posterior_mu_init=posterior_mu_init,
+                    posterior_rho_init=posterior_rho_init,
+                    in_features=out_features,
+                    out_features=out_features * 4,
+                    bias=bias)
+            }))
 
-        self.backward_hh = LinearReparameterization(
-            prior_mean=prior_mean,
-            prior_variance=prior_variance,
-            posterior_mu_init=posterior_mu_init,
-            posterior_rho_init=posterior_rho_init,
-            in_features=out_features,
-            out_features=out_features * 4,
-            bias=bias)
+            # Backward LSTM
+            self.backward_layers.append(nn.ModuleDict({
+                'ih': LinearReparameterization(
+                    prior_mean=prior_mean,
+                    prior_variance=prior_variance,
+                    posterior_mu_init=posterior_mu_init,
+                    posterior_rho_init=posterior_rho_init,
+                    in_features=layer_in_features,
+                    out_features=out_features * 4,
+                    bias=bias),
+                'hh': LinearReparameterization(
+                    prior_mean=prior_mean,
+                    prior_variance=prior_variance,
+                    posterior_mu_init=posterior_mu_init,
+                    posterior_rho_init=posterior_rho_init,
+                    in_features=out_features,
+                    out_features=out_features * 4,
+                    bias=bias)
+            }))
 
     def kl_loss(self):
-        return (self.forward_ih.kl_loss() + self.forward_hh.kl_loss() +
-                self.backward_ih.kl_loss() + self.backward_hh.kl_loss())
+        kl = 0
+        for layer in range(self.num_layers):
+            kl += (self.forward_layers[layer]['ih'].kl_loss() +
+                   self.forward_layers[layer]['hh'].kl_loss() +
+                   self.backward_layers[layer]['ih'].kl_loss() +
+                   self.backward_layers[layer]['hh'].kl_loss())
+        return kl
 
-    def _process_direction(self, X, ih, hh, reverse=False):
+    def _process_direction(self, X, layer, reverse=False):
         batch_size, seq_size, _ = X.size()
         hidden_seq = []
         h_t = c_t = torch.zeros(batch_size, self.out_features).to(X.device)
         HS = self.out_features
         kl = 0
 
+        ih, hh = (layer['ih'], layer['hh'])
         sequence = range(seq_size) if not reverse else range(seq_size - 1, -1, -1)
 
         for t in sequence:
@@ -273,18 +291,29 @@ class BidirectionalLSTMReparameterization(BaseVariationalLayer_):
     def forward(self, X, hidden_states=None, return_kl=True):
         if self.dnn_to_bnn_flag:
             return_kl = False
+
+        # If batch_first, transpose the input
         if self.batch_first:
             X = X.transpose(0, 1)
 
-        forward_hidden, forward_kl = self._process_direction(X, self.forward_ih, self.forward_hh)
-        backward_hidden, backward_kl = self._process_direction(X, self.backward_ih, self.backward_hh, reverse=True)
+        kl_total = 0
+        for layer in range(self.num_layers):
+            forward_hidden, forward_kl = self._process_direction(X, self.forward_layers[layer])
+            backward_hidden, backward_kl = self._process_direction(X, self.backward_layers[layer], reverse=True)
 
-        # Concatenate forward and backward sequences
-        hidden_seq = torch.cat([forward_hidden, backward_hidden], dim=2)
-        
-        # Reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
-        hidden_seq = hidden_seq.transpose(0, 1).contiguous()
+            # Concatenate forward and backward sequences
+            hidden_seq = torch.cat([forward_hidden, backward_hidden], dim=2)
+            kl_total += forward_kl + backward_kl
+
+            # Use this layer's output as input to the next layer
+            X = hidden_seq
+
+        # If batch_first, transpose the output back
+        if self.batch_first:
+            hidden_seq = hidden_seq.transpose(0, 1)
+        else:
+            hidden_seq = hidden_seq.contiguous()
 
         if return_kl:
-            return hidden_seq, None, forward_kl + backward_kl
+            return hidden_seq, None, kl_total
         return hidden_seq, None
