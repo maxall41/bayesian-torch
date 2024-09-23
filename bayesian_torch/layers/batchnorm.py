@@ -91,6 +91,8 @@ class BatchNorm1dLayer(nn.Module):
 
 
     def forward(self, input):
+        print(input)
+        print(input[0].shape)
         out = self.norm(input[0])
         kl = 0
         return out, kl
