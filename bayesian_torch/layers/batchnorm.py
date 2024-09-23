@@ -121,7 +121,7 @@ class BatchNorm1dLayer(nn.Module):
             self.bias.data.zero_()
 
     def _check_input_dim(self, input):
-        if input.dim() != 3:
+        if input.dim() != 3 and input.dim() != 2:
             raise ValueError('expected 3D input (got {}D input)'.format(
                 input.dim()))
 
