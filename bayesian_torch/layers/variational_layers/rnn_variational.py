@@ -39,6 +39,7 @@
 
 from .linear_variational import LinearReparameterization
 from ..base_variational_layer import BaseVariationalLayer_
+import torch.nn as nn
 
 import torch
 
