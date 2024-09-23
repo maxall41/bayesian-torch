@@ -4,3 +4,4 @@ from .base_variational_layer import *
 from .batchnorm import *
 from .dropout import *
 from .activations import *
+from .pool import *
