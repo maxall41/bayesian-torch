@@ -183,6 +183,7 @@ class Conv1dReparameterization(BaseVariationalLayer_):
     def forward(self, input, return_kl=True):
         if self.dnn_to_bnn_flag:
             return_kl = False
+        input = input[0]
 
         sigma_weight = torch.log1p(torch.exp(self.rho_kernel))
         eps_kernel = self.eps_kernel.data.normal_()
@@ -357,6 +358,7 @@ class Conv2dReparameterization(BaseVariationalLayer_):
     def forward(self, input, return_kl=True):
         if self.dnn_to_bnn_flag:
             return_kl = False
+        input = input[0]
 
         sigma_weight = torch.log1p(torch.exp(self.rho_kernel))
         eps_kernel = self.eps_kernel.data.normal_()
@@ -530,6 +532,7 @@ class Conv3dReparameterization(BaseVariationalLayer_):
     def forward(self, input, return_kl=True):
         if self.dnn_to_bnn_flag:
             return_kl = False
+        input = input[0]
 
         sigma_weight = torch.log1p(torch.exp(self.rho_kernel))
         eps_kernel = self.eps_kernel.data.normal_()
