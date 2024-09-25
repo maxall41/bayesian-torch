@@ -167,7 +167,7 @@ from ..base_variational_layer import BaseVariationalLayer_
 class BayesianLSTM(BaseVariationalLayer_):
     def __init__(self, in_features, out_features, num_layers=1, bias=True, batch_first=False, 
                  dropout=0., bidirectional=False, prior_mean=0, prior_variance=1, 
-                 posterior_mu_init=0, posterior_rho_init=-3.0):
+                 posterior_mu_init=0, posterior_rho_init=-3.0, device=None):
         super().__init__()
         
         self.in_features = in_features
@@ -179,17 +179,18 @@ class BayesianLSTM(BaseVariationalLayer_):
         self.bidirectional = bidirectional
         self.prior_mean = prior_mean
         self.prior_variance = prior_variance
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Create a standard PyTorch LSTM
         self.lstm = nn.LSTM(in_features, out_features, num_layers, bias=bias, 
-                            batch_first=batch_first, dropout=dropout, bidirectional=bidirectional)
+                            batch_first=batch_first, dropout=dropout, bidirectional=bidirectional).to(self.device)
         
         # Initialize posterior parameters
-        self.weight_mu = Parameter(torch.Tensor(self.lstm.all_weights[0][0].shape))
-        self.weight_rho = Parameter(torch.Tensor(self.lstm.all_weights[0][0].shape))
+        self.weight_mu = Parameter(torch.Tensor(*self.lstm.all_weights[0][0].shape).to(self.device))
+        self.weight_rho = Parameter(torch.Tensor(*self.lstm.all_weights[0][0].shape).to(self.device))
         if bias:
-            self.bias_mu = Parameter(torch.Tensor(self.lstm.all_weights[0][1].shape))
-            self.bias_rho = Parameter(torch.Tensor(self.lstm.all_weights[0][1].shape))
+            self.bias_mu = Parameter(torch.Tensor(*self.lstm.all_weights[0][1].shape).to(self.device))
+            self.bias_rho = Parameter(torch.Tensor(*self.lstm.all_weights[0][1].shape).to(self.device))
         
         # Initialize posterior
         self.weight_mu.data.normal_(posterior_mu_init, 0.1)
@@ -203,12 +204,17 @@ class BayesianLSTM(BaseVariationalLayer_):
             self.bias_sigma = torch.log1p(torch.exp(self.bias_rho))
     
     def forward(self, x, hidden_states=None, return_kl=True):
+        # Ensure input is on the correct device
+        x = x.to(self.device)
+        if hidden_states is not None:
+            hidden_states = tuple(h.to(self.device) for h in hidden_states)
+        
         # Sample weights
-        weight_epsilon = torch.randn_like(self.weight_mu)
+        weight_epsilon = torch.randn_like(self.weight_mu, device=self.device)
         weight = self.weight_mu + self.weight_sigma * weight_epsilon
         
         if self.bias:
-            bias_epsilon = torch.randn_like(self.bias_mu)
+            bias_epsilon = torch.randn_like(self.bias_mu, device=self.device)
             bias = self.bias_mu + self.bias_sigma * bias_epsilon
         else:
             bias = None
@@ -239,3 +245,16 @@ class BayesianLSTM(BaseVariationalLayer_):
         kl = 0.5 * (2 * torch.log(sig_p / sig_q) - 1 + (sig_q / sig_p).pow(2) + 
                     ((mu_p - mu_q) / sig_p).pow(2)).sum()
         return kl
+
+    def to(self, device):
+        self.device = device
+        self.lstm.to(device)
+        self.weight_mu.data = self.weight_mu.data.to(device)
+        self.weight_rho.data = self.weight_rho.data.to(device)
+        if self.bias:
+            self.bias_mu.data = self.bias_mu.data.to(device)
+            self.bias_rho.data = self.bias_rho.data.to(device)
+        self.weight_sigma = self.weight_sigma.to(device)
+        if self.bias:
+            self.bias_sigma = self.bias_sigma.to(device)
+        return self
