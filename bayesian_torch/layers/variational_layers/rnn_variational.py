@@ -158,163 +158,84 @@ class LSTMReparameterization(BaseVariationalLayer_):
         return hidden_seq, (hidden_seq, c_ts)
 
 
-class BidirectionalLSTMReparameterization(BaseVariationalLayer_):
-    def __init__(self,
-                 in_features,
-                 out_features,
-                 num_layers=1,
-                 prior_mean=0,
-                 prior_variance=1,
-                 posterior_mu_init=0,
-                 posterior_rho_init=-3.0,
-                 bias=True,
-                 batch_first=False):
-        """
-        Implements Multi-layer Bidirectional LSTM layer with reparameterization trick.
+import torch
+import torch.nn as nn
+from torch.nn import Parameter
+import torch.nn.functional as F
+from ..base_variational_layer import BaseVariationalLayer_
 
-        Inherits from bayesian_torch.layers.BaseVariationalLayer_
-
-        Parameters:
-            in_features: int -> size of each input sample,
-            out_features: int -> size of each output sample,
-            num_layers: int -> number of recurrent layers. Default: 1
-            prior_mean: float -> mean of the prior arbitrary distribution to be used on the complexity cost,
-            prior_variance: float -> variance of the prior arbitrary distribution to be used on the complexity cost,
-            posterior_mu_init: float -> init std for the trainable mu parameter, sampled from N(0, posterior_mu_init),
-            posterior_rho_init: float -> init std for the trainable rho parameter, sampled from N(0, posterior_rho_init),
-            bias: bool -> if set to False, the layer will not learn an additive bias. Default: True,
-            batch_first: bool -> if True, then the input and output tensors are provided as (batch, seq, feature). Default: False
-        """
+class BayesianLSTM(BaseVariationalLayer_):
+    def __init__(self, in_features, out_features, num_layers=1, bias=True, batch_first=False, 
+                 dropout=0., bidirectional=False, prior_mean=0, prior_variance=1, 
+                 posterior_mu_init=0, posterior_rho_init=-3.0):
         super().__init__()
-
+        
         self.in_features = in_features
         self.out_features = out_features
         self.num_layers = num_layers
-        self.prior_mean = prior_mean
-        self.prior_variance = prior_variance
-        self.posterior_mu_init = posterior_mu_init
-        self.posterior_rho_init = posterior_rho_init
         self.bias = bias
         self.batch_first = batch_first
-
-        self.forward_layers = nn.ModuleList()
-        self.backward_layers = nn.ModuleList()
-
-        for layer in range(num_layers):
-            layer_in_features = in_features if layer == 0 else out_features * 2
-
-            # Forward LSTM
-            self.forward_layers.append(nn.ModuleDict({
-                'ih': LinearReparameterization(
-                    prior_mean=prior_mean,
-                    prior_variance=prior_variance,
-                    posterior_mu_init=posterior_mu_init,
-                    posterior_rho_init=posterior_rho_init,
-                    in_features=layer_in_features,
-                    out_features=out_features * 4,
-                    bias=bias),
-                'hh': LinearReparameterization(
-                    prior_mean=prior_mean,
-                    prior_variance=prior_variance,
-                    posterior_mu_init=posterior_mu_init,
-                    posterior_rho_init=posterior_rho_init,
-                    in_features=out_features,
-                    out_features=out_features * 4,
-                    bias=bias)
-            }))
-
-            # Backward LSTM
-            self.backward_layers.append(nn.ModuleDict({
-                'ih': LinearReparameterization(
-                    prior_mean=prior_mean,
-                    prior_variance=prior_variance,
-                    posterior_mu_init=posterior_mu_init,
-                    posterior_rho_init=posterior_rho_init,
-                    in_features=layer_in_features,
-                    out_features=out_features * 4,
-                    bias=bias),
-                'hh': LinearReparameterization(
-                    prior_mean=prior_mean,
-                    prior_variance=prior_variance,
-                    posterior_mu_init=posterior_mu_init,
-                    posterior_rho_init=posterior_rho_init,
-                    in_features=out_features,
-                    out_features=out_features * 4,
-                    bias=bias)
-            }))
-
-    def kl_loss(self):
-        kl = 0
-        for layer in range(self.num_layers):
-            kl += (self.forward_layers[layer]['ih'].kl_loss() +
-                   self.forward_layers[layer]['hh'].kl_loss() +
-                   self.backward_layers[layer]['ih'].kl_loss() +
-                   self.backward_layers[layer]['hh'].kl_loss())
-        return kl
-
-    def _process_direction(self, X, layer, reverse=False):
-        batch_size, seq_size, _ = X.size()
-        hidden_seq = []
-        h_t = c_t = torch.zeros(batch_size, self.out_features).to(X.device)
-        HS = self.out_features
-        kl = 0
-
-        ih, hh = (layer['ih'], layer['hh'])
-        sequence = range(seq_size) if not reverse else range(seq_size - 1, -1, -1)
-
-        for t in sequence:
-            x_t = X[:, t, :]
-
-            ff_i, kl_i = ih(x_t)
-            ff_h, kl_h = hh(h_t)
-            gates = ff_i + ff_h
-
-            kl += kl_i + kl_h
-
-            i_t, f_t, g_t, o_t = (
-                torch.sigmoid(gates[:, :HS]),  # input
-                torch.sigmoid(gates[:, HS:HS * 2]),  # forget
-                torch.tanh(gates[:, HS * 2:HS * 3]),
-                torch.sigmoid(gates[:, HS * 3:]),  # output
-            )
-
-            c_t = f_t * c_t + i_t * g_t
-            h_t = o_t * torch.tanh(c_t)
-
-            hidden_seq.append(h_t.unsqueeze(0))
-
-        hidden_seq = torch.cat(hidden_seq, dim=0)
-        if reverse:
-            hidden_seq = hidden_seq.flip(0)
+        self.dropout = dropout
+        self.bidirectional = bidirectional
+        self.prior_mean = prior_mean
+        self.prior_variance = prior_variance
         
-        return hidden_seq, kl
-
-    def forward(self, X, hidden_states=None, return_kl=True):
-        if self.dnn_to_bnn_flag:
-            return_kl = False
-
-        # If batch_first, transpose the input
-        if self.batch_first:
-            X = X.transpose(0, 1)
-
-        kl_total = 0
-        for layer in range(self.num_layers):
-            forward_hidden, forward_kl = self._process_direction(X, self.forward_layers[layer])
-            backward_hidden, backward_kl = self._process_direction(X, self.backward_layers[layer], reverse=True)
-
-            # Concatenate forward and backward sequences
-            hidden_seq = torch.cat([forward_hidden, backward_hidden], dim=2)
-            kl_total += forward_kl + backward_kl
-
-            # Use this layer's output as input to the next layer
-            X = hidden_seq
-
-        # If batch_first, transpose the output back
-        if self.batch_first:
-            hidden_seq = hidden_seq.transpose(0, 1)
+        # Create a standard PyTorch LSTM
+        self.lstm = nn.LSTM(in_features, out_features, num_layers, bias=bias, 
+                            batch_first=batch_first, dropout=dropout, bidirectional=bidirectional)
+        
+        # Initialize posterior parameters
+        self.weight_mu = Parameter(torch.Tensor(self.lstm.all_weights[0][0].shape))
+        self.weight_rho = Parameter(torch.Tensor(self.lstm.all_weights[0][0].shape))
+        if bias:
+            self.bias_mu = Parameter(torch.Tensor(self.lstm.all_weights[0][1].shape))
+            self.bias_rho = Parameter(torch.Tensor(self.lstm.all_weights[0][1].shape))
+        
+        # Initialize posterior
+        self.weight_mu.data.normal_(posterior_mu_init, 0.1)
+        self.weight_rho.data.normal_(posterior_rho_init, 0.1)
+        if bias:
+            self.bias_mu.data.normal_(posterior_mu_init, 0.1)
+            self.bias_rho.data.normal_(posterior_rho_init, 0.1)
+        
+        self.weight_sigma = torch.log1p(torch.exp(self.weight_rho))
+        if bias:
+            self.bias_sigma = torch.log1p(torch.exp(self.bias_rho))
+    
+    def forward(self, x, hidden_states=None, return_kl=True):
+        # Sample weights
+        weight_epsilon = torch.randn_like(self.weight_mu)
+        weight = self.weight_mu + self.weight_sigma * weight_epsilon
+        
+        if self.bias:
+            bias_epsilon = torch.randn_like(self.bias_mu)
+            bias = self.bias_mu + self.bias_sigma * bias_epsilon
         else:
-            hidden_seq = hidden_seq.contiguous()
-
+            bias = None
+        
+        # Replace LSTM weights with sampled weights
+        with torch.no_grad():
+            for i in range(len(self.lstm.all_weights)):
+                self.lstm.all_weights[i][0].copy_(weight)
+                if self.bias:
+                    self.lstm.all_weights[i][1].copy_(bias)
+        
+        # Forward pass
+        output, hidden = self.lstm(x, hidden_states)
+        
         if return_kl:
-            return hidden_seq, None, kl_total
-        return hidden_seq, None
+            kl = self.kl_loss()
+            return output, hidden, kl
+        return output, hidden
+    
+    def kl_loss(self):
+        kl = self.kl_div(self.weight_mu, self.weight_sigma, self.prior_mean, self.prior_variance)
+        if self.bias:
+            kl += self.kl_div(self.bias_mu, self.bias_sigma, self.prior_mean, self.prior_variance)
+        return kl
+    
+    @staticmethod
+    def kl_div(mu_q, sig_q, mu_p, sig_p):
+        kl = 0.5 * (2 * torch.log(sig_p / sig_q) - 1 + (sig_q / sig_p).pow(2) + 
+                    ((mu_p - mu_q) / sig_p).pow(2)).sum()
+        return kl
